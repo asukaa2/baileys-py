@@ -1,0 +1,18 @@
+# Include README and license in sdist
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+
+# Include the auto-generated constants file (very important — the binary
+# protocol encoder/decoder depends on the 1300-line token dictionary).
+recursive-include baileys_py *.py
+
+# Include the type marker for PEP 561.
+include baileys_py/py.typed
+
+# Include examples so the source distribution is self-contained.
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include scripts *.py
+recursive-include docs *.md

@@ -5,17 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "baileys-py"
 version = "0.1.0"
-description = "A simple, Pythonic re-implementation of the Baileys WhatsApp Web API"
+description = "A simple Pythonic re-implementation of the Baileys WhatsApp Web API"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "baileys-py contributors" }]
+authors = [
+    { name = "AsukaDev", email = "asukaa2@users.noreply.github.com" }
+]
 keywords = ["whatsapp", "baileys", "wa", "bot", "websocket"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: OS Independent",
     "Development Status :: 3 - Alpha",
 ]
 dependencies = [
@@ -23,19 +30,48 @@ dependencies = [
     "cryptography>=41.0",
     "qrcode>=7.4",
     "protobuf>=4.24",
-    "pino>=0.1",
     "aiofiles>=23.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.1"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1",
+    "build>=0.10",
+]
+examples = [
+    "qrcode>=7.4",
+]
 
 [project.urls]
-Source = "https://github.com/whiskeysockets/Baileys"
+Source = "https://github.com/asukaa2/baileys-py"
+Documentation = "https://github.com/asukaa2/baileys-py/tree/main/docs"
+Issues = "https://github.com/asukaa2/baileys-py/issues"
+
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["baileys_py*"]
+exclude = ["tests*", "examples*", "scripts*"]
+
+[tool.setuptools.package-data]
+"baileys_py" = ["py.typed"]
+"baileys_py.binary" = ["*.py"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "B008"]
