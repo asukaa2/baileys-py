@@ -156,6 +156,14 @@ class SocketConfig:
     media_cache: Optional[CacheStore] = None
     msg_retry_counter_cache: Optional[CacheStore] = None
     user_devices_cache: Optional[CacheStore] = None
+    # --- auto-reconnect (fixes "no close frame received or sent" errors) ---
+    auto_reconnect: bool = True
+    max_reconnect_attempts: int = 10
+    reconnect_delay_ms: int = 2_000
+    reconnect_max_delay_ms: int = 60_000
+    reconnect_backoff_multiplier: float = 1.5
+    # --- timeout for an idle connection before the server drops us ---
+    idle_timeout_ms: int = 60_000
     get_message: Optional[Callable[["WAMessageKey"], Awaitable[Any]]] = None
     cached_group_metadata: Optional[Callable[[str], Awaitable[Any]]] = None
     should_ignore_jid: Optional[Callable[[str], bool]] = None

@@ -93,6 +93,15 @@ DEFAULT_CONNECTION_CONFIG = SocketConfig(
     max_msg_retry_count=5,
     qr_timeout_ms=60_000,
     country_code="US",
+    # Auto-reconnect (fixes "no close frame received or sent" errors that
+    # happen when WA server times out our connection without sending a
+    # proper WebSocket close frame).
+    auto_reconnect=True,
+    max_reconnect_attempts=10,
+    reconnect_delay_ms=2_000,
+    reconnect_max_delay_ms=60_000,
+    reconnect_backoff_multiplier=1.5,
+    idle_timeout_ms=60_000,
 )
 
 

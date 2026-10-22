@@ -191,6 +191,122 @@ def test_make_socket_with_auth():
 
 
 # ---------------------------------------------------------------------------
+# Auto-reconnect + error handling (the "no close frame received or sent" fix)
+# ---------------------------------------------------------------------------
+
+def test_default_config_has_auto_reconnect():
+    """Auto-reconnect is ON by default with sensible backoff."""
+    from baileys_py import DEFAULT_CONNECTION_CONFIG
+    assert DEFAULT_CONNECTION_CONFIG.auto_reconnect is True
+    assert DEFAULT_CONNECTION_CONFIG.max_reconnect_attempts >= 1
+    assert DEFAULT_CONNECTION_CONFIG.reconnect_delay_ms > 0
+    assert DEFAULT_CONNECTION_CONFIG.reconnect_max_delay_ms >= DEFAULT_CONNECTION_CONFIG.reconnect_delay_ms
+    assert DEFAULT_CONNECTION_CONFIG.reconnect_backoff_multiplier > 1.0
+
+
+def test_classify_close_no_close_frame():
+    """ConnectionClosedError (the 'no close frame received or sent' case)
+    maps to connection_lost; ConnectionClosedOK maps to restart_required."""
+    from baileys_py import DisconnectReason
+    from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+
+    folder = tempfile.mkdtemp(prefix="baileys-py-test-")
+    async def run():
+        state, _ = await bp.use_multi_file_auth_state(folder)
+        sock = bp.make_wa_socket(auth=state)
+        # Abrupt close — the rcvd=None, sent=None case represents
+        # "no close frame received or sent" (the exact error the user
+        # reported).
+        exc = ConnectionClosedError(rcvd=None, sent=None)
+        status = sock._classify_close(exc)
+        assert status == DisconnectReason.connection_lost.value, \
+            f"expected connection_lost, got {status}"
+        # Clean close — both frames present → restart_required.
+        ok_exc = ConnectionClosedOK(rcvd=None, sent=None)
+        assert sock._classify_close(ok_exc) == DisconnectReason.restart_required.value
+
+    asyncio.run(run())
+
+
+def test_maybe_schedule_reconnect_respects_intentional_disconnect():
+    """If the user called disconnect(), auto-reconnect does NOT fire."""
+    folder = tempfile.mkdtemp(prefix="baileys-py-test-")
+    async def run():
+        state, _ = await bp.use_multi_file_auth_state(folder)
+        sock = bp.make_wa_socket(auth=state)
+        await sock.disconnect()
+        # _maybe_schedule_reconnect should be a no-op now
+        sock._maybe_schedule_reconnect()
+        assert sock._reconnect_task is None, "scheduled a reconnect despite disconnect()"
+
+    asyncio.run(run())
+
+
+def test_maybe_schedule_reconnect_disabled_via_config():
+    folder = tempfile.mkdtemp(prefix="baileys-py-test-")
+    async def run():
+        state, _ = await bp.use_multi_file_auth_state(folder)
+        sock = bp.make_wa_socket(auth=state, auto_reconnect=False)
+        sock._maybe_schedule_reconnect()
+        assert sock._reconnect_task is None, "scheduled a reconnect despite auto_reconnect=False"
+
+    asyncio.run(run())
+
+
+def test_maybe_schedule_reconnect_caps_attempts():
+    folder = tempfile.mkdtemp(prefix="baileys-py-test-")
+    async def run():
+        state, _ = await bp.use_multi_file_auth_state(folder)
+        sock = bp.make_wa_socket(auth=state, max_reconnect_attempts=2)
+        sock._reconnect_attempts = 5  # already past the cap
+        sock._maybe_schedule_reconnect()
+        assert sock._reconnect_task is None, "scheduled a reconnect past the cap"
+
+    asyncio.run(run())
+
+
+def test_recv_loop_handles_connection_closed_error_gracefully():
+    """The recv loop must NOT log "recv loop crashed" for a
+    ConnectionClosedError — it should emit a clean close event and
+    schedule a reconnect (unless auto_reconnect=False).
+    """
+    from websockets.exceptions import ConnectionClosedError
+
+    folder = tempfile.mkdtemp(prefix="baileys-py-test-")
+    async def run():
+        state, _ = await bp.use_multi_file_auth_state(folder)
+        sock = bp.make_wa_socket(auth=state, auto_reconnect=False)
+        # Simulate a closed WS by setting _ws to a fake that raises
+        # ConnectionClosedError on iteration.
+        class _FakeWS:
+            closed = True
+            def __aiter__(self):
+                return self
+            async def __anext__(self):
+                raise ConnectionClosedError(rcvd=None, sent=None)
+
+        sock._ws = _FakeWS()
+        sock._noise = bp.NoiseHandler(bp.generate_key_pair())
+
+        events = []
+        sock.ev.on("connection.update", lambda d: events.append(d))
+
+        await sock._recv_loop()
+
+        # Expect a close event with last_disconnect metadata
+        close_events = [e for e in events if e.get("connection") == "close"]
+        assert close_events, f"expected a close event, got {events}"
+        last = close_events[-1]
+        assert "last_disconnect" in last, f"missing last_disconnect: {last}"
+        assert "error" in last["last_disconnect"]
+        assert "status" in last["last_disconnect"]
+        # No reconnect scheduled (auto_reconnect=False)
+        assert sock._reconnect_task is None
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
 # Logger
 # ---------------------------------------------------------------------------
 

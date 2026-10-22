@@ -74,6 +74,68 @@ pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple protobuf
 
 ## Runtime errors
 
+### `recv loop crashed {'err': 'no close frame received or sent'}`
+
+This is `websockets.ConnectionClosedError`. The WhatsApp server closed
+the TCP connection **without sending a WebSocket close frame**. This is
+normal when:
+
+* **WA server times us out** because we didn't send the Noise
+  handshake fast enough (the most common cause — baileys-py is
+  currently scaffolded and doesn't fully complete the Noise XX
+  handshake without the WAProto protobuf schema).
+* **The network dropped** mid-connection (mobile / flaky Wi-Fi).
+* **WA killed our connection** because we logged in from elsewhere.
+
+As of `0.1.0`, baileys-py handles this gracefully:
+
+* The recv loop logs `WARNING | WS closed (no close frame) — scheduling reconnect`
+  instead of `ERROR | recv loop crashed`. The status code (`428`
+  = connection_lost) is in the log.
+* A `connection.update` event is emitted with
+  `{connection: "close", last_disconnect: {error: ..., status: 428}}`.
+* An **auto-reconnect with exponential backoff** is scheduled.
+
+You can control the reconnect behaviour via `SocketConfig`:
+
+```python
+sock = make_wa_socket(
+    auth=state,
+    auto_reconnect=True,            # default: True
+    max_reconnect_attempts=10,       # default: 10 (then gives up)
+    reconnect_delay_ms=2_000,        # default: 2000ms base delay
+    reconnect_max_delay_ms=60_000,   # default: 60000ms cap
+    reconnect_backoff_multiplier=1.5,# default: 1.5× per attempt
+)
+```
+
+To turn auto-reconnect off:
+
+```python
+sock = make_wa_socket(auth=state, auto_reconnect=False)
+```
+
+To react to the close event in your own code (e.g. to refresh UI or
+alert a monitoring system):
+
+```python
+@sock.ev.on("connection.update")
+async def on_conn(update):
+    if update.get("connection") == "close":
+        ld = update.get("last_disconnect") or {}
+        status = ld.get("status")
+        if status == 401:  # logged_out
+            print("Account was logged out — clear ./auth_info and re-scan")
+        elif status == 428:  # connection_lost
+            print("Network/server dropped — auto-reconnect in progress")
+```
+
+> **Note**: baileys-py currently sends the initial `<stream:open>` frame
+> on connect (so WA doesn't time us out instantly), but the full Noise
+> handshake requires the WhatsApp protobuf schema (`WAProto/`). Without
+> it, WA will still close the connection after a short delay. To enable
+> full interop, see [Internals → Extending baileys-py](internals.md#extending-baileys-py).
+
 ### `RuntimeError: socket is not connected`
 
 You called `sock.send_message` / `sock.send_raw_frame` before the

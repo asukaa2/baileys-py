@@ -43,6 +43,16 @@ import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import websockets
+try:
+    # websockets >= 11 exports exceptions at the top level
+    from websockets.exceptions import (
+        ConnectionClosed,
+        ConnectionClosedError,
+        ConnectionClosedOK,
+    )
+except ImportError:  # pragma: no cover
+    # Fallback for very old websockets versions
+    ConnectionClosed = ConnectionClosedError = ConnectionClosedOK = Exception  # type: ignore
 
 from .binary import (
     BinaryNode,
@@ -92,6 +102,33 @@ def _build_pairing_qr_data(qr_string: str, noise_pub: bytes) -> str:
     return f"{qr_string},{pub_hex},adv"
 
 
+def _ws_is_closed(ws) -> bool:
+    """Check whether a websockets connection is closed.
+
+    The websockets library has changed this attribute across versions:
+
+    - ``websockets<11`` (legacy asyncio): ``ws.closed`` is a bool.
+    - ``websockets>=11``: still has ``ws.closed`` (deprecated in some versions).
+    - ``websockets>=14`` (new asyncio API): ``ws.closed`` removed; use
+      ``ws.close_code is not None``.
+
+    This helper handles all three without raising.
+    """
+    if ws is None:
+        return True
+    if hasattr(ws, "closed"):
+        try:
+            return bool(ws.closed)
+        except Exception:
+            pass
+    if hasattr(ws, "close_code"):
+        try:
+            return ws.close_code is not None
+        except Exception:
+            pass
+    return False
+
+
 class WASocket:
     """A simplified WhatsApp Web socket.
 
@@ -110,8 +147,14 @@ class WASocket:
         self._noise: Optional[NoiseHandler] = None
         self._recv_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
         self._user: Optional[Dict[str, Any]] = None
         self._pending_queries: Dict[str, asyncio.Future] = {}
+
+        # Reconnect bookkeeping
+        self._reconnect_attempts: int = 0
+        self._is_intentional_disconnect: bool = False
+        self._connect_lock = asyncio.Lock()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._send_lock = asyncio.Lock()
 
@@ -144,52 +187,137 @@ class WASocket:
     # Connection lifecycle
     # ------------------------------------------------------------------
     async def connect(self) -> None:
-        """Open the WebSocket and start the receiver loop."""
-        url = self.config.wa_websocket_url or WA_WEBSOCKET_URL
-        self.logger.info({"url": url}, "Connecting to WhatsApp Web")
-        self.connection_state.connection = "connecting"
-        self.ev.emit("connection.update", {"connection": "connecting"})
+        """Open the WebSocket and start the receiver loop.
 
+        Safe to call multiple times — uses an :class:`asyncio.Lock` so
+        concurrent calls won't double-open.
+        """
+        async with self._connect_lock:
+            # If we're already open / connecting, do nothing.
+            if self.connection_state.connection in ("open", "connecting") and self._ws:
+                return
+
+            self._is_intentional_disconnect = False
+            url = self.config.wa_websocket_url or WA_WEBSOCKET_URL
+            self.logger.info({"url": url, "attempt": self._reconnect_attempts + 1},
+                             "Connecting to WhatsApp Web")
+            self.connection_state.connection = "connecting"
+            self.ev.emit("connection.update", {"connection": "connecting"})
+
+            try:
+                self._ws = await asyncio.wait_for(
+                    self._open_websocket(url),
+                    timeout=self.config.connect_timeout_ms / 1000,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warn({"url": url}, "WS connect timed out")
+                self._emit_close(
+                    error="connect timeout",
+                    status=DisconnectReason.timed_out.value,
+                )
+                self._maybe_schedule_reconnect()
+                return
+            except (OSError, websockets.exceptions.InvalidURI,
+                    websockets.exceptions.InvalidHandshake) as exc:
+                self.logger.error({"err": str(exc)}, "WS connection failed")
+                self._emit_close(error=str(exc),
+                                 status=DisconnectReason.connection_lost.value)
+                self._maybe_schedule_reconnect()
+                return
+
+            # Initialise noise handler with the client's noise key.
+            self._noise = NoiseHandler(self.auth_state.creds.noise_key,
+                                       noise_header=NOISE_WA_HEADER,
+                                       routing_info=self.auth_state.creds.routing_info)
+
+            # Reset reconnect attempts on successful open
+            self._reconnect_attempts = 0
+            # Cancel any pending reconnect task — we're connected now.
+            if self._reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
+                self._reconnect_task = None
+
+            self._recv_task = asyncio.ensure_future(self._recv_loop())
+            self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
+
+            # Send the WA intro frame so the server doesn't time us out.
+            # The first frame's payload is a stream:open XML stanza (the
+            # binary protocol encodes it). The NoiseHandler prepends the
+            # WA intro header (``WA\\x06\\x03``) automatically on the
+            # first call to ``encode_frame``.
+            try:
+                await self._send_initial_frame()
+            except Exception as exc:
+                self.logger.warn({"err": str(exc)}, "Failed to send initial frame")
+
+            # Emit an open-connection event.
+            self.connection_state.connection = "open"
+            self.ev.emit("connection.update", {"connection": "open"})
+
+    async def _open_websocket(self, url: str):
+        """Hook so subclasses can customise the WebSocket creation."""
+        headers = {
+            "Origin": "https://web.whatsapp.com",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        # websockets >= 11 uses additional_headers; older versions used
+        # extra_headers. Try both.
+        kwargs = dict(
+            subprotocols=None,
+            ping_interval=None,
+            ping_timeout=None,
+            max_size=2 ** 24,
+        )
         try:
-            self._ws = await asyncio.wait_for(
-                websockets.connect(
-                    url,
-                    subprotocols=None,
-                    additional_headers={
-                        "Origin": "https://web.whatsapp.com",
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                      "Chrome/120.0.0.0 Safari/537.36",
-                    },
-                    ping_interval=None,
-                    ping_timeout=None,
-                    max_size=2 ** 24,
-                ),
-                timeout=self.config.connect_timeout_ms / 1000,
+            return await websockets.connect(
+                url, additional_headers=headers, **kwargs,
             )
-        except Exception as exc:
-            self.logger.error({"err": str(exc)}, "WS connection failed")
-            self.ev.emit("connection.update", {
-                "connection": "close",
-                "last_disconnect": {"error": str(exc),
-                                     "status": DisconnectReason.connection_lost.value},
-            })
+        except TypeError:  # pragma: no cover
+            return await websockets.connect(
+                url, extra_headers=headers, **kwargs,
+            )
+
+    async def _send_initial_frame(self) -> None:
+        """Send the first frame after the WebSocket is open.
+
+        We send a ``<stream:open>`` XML stanza (the very first stanza in
+        WA Web's protocol). The :class:`NoiseHandler` prepends the WA
+        intro header (``WA\\x06\\x03``) on the very first frame
+        automatically. Without this, WA server times out waiting for our
+        handshake and closes the TCP connection without sending a
+        WebSocket close frame — that's the ``no close frame received
+        or sent`` error.
+        """
+        if not self._ws:
             return
-
-        # Initialise noise handler with the client's noise key.
-        self._noise = NoiseHandler(self.auth_state.creds.noise_key,
-                                   noise_header=NOISE_WA_HEADER,
-                                   routing_info=self.auth_state.creds.routing_info)
-        self._recv_task = asyncio.ensure_future(self._recv_loop())
-        self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
-
-        # Emit an open-connection event. In a full implementation we'd
-        # also fire the QR/login flow here.
-        self.connection_state.connection = "open"
-        self.ev.emit("connection.update", {"connection": "open"})
+        if _ws_is_closed(self._ws):
+            return
+        stream_open = BinaryNode(
+            tag="xmlstreamstart",
+            attrs={"to": "web.whatsapp.com", "version": "1.0",
+                   "xmlns": "urn:ietf:params:xml:ns:xmpp-streams"},
+            content=None,
+        )
+        encoded = encode_binary_node(stream_open)
+        frame = self._noise.encode_frame(encoded)
+        async with self._send_lock:
+            await self._ws.send(frame)
+        self.logger.debug({"len": len(frame)}, "sent initial stream:open")
 
     async def disconnect(self) -> None:
-        """Close the WebSocket cleanly."""
+        """Close the WebSocket cleanly.
+
+        Marks the disconnect as intentional so the auto-reconnect logic
+        does NOT kick in.
+        """
+        self._is_intentional_disconnect = True
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         if self._keepalive_task:
             self._keepalive_task.cancel()
             self._keepalive_task = None
@@ -197,28 +325,147 @@ class WASocket:
             self._recv_task.cancel()
             self._recv_task = None
         if self._ws:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception as exc:
+                self.logger.debug({"err": str(exc)}, "WS close failed")
             self._ws = None
         self.connection_state.connection = "close"
         self.ev.emit("connection.update", {"connection": "close"})
 
+    # ------------------------------------------------------------------
+    # Error handling + auto-reconnect
+    # ------------------------------------------------------------------
+    def _emit_close(self, error: str, status: int) -> None:
+        """Emit a ``connection.update`` close event with a structured
+        ``last_disconnect`` payload.
+        """
+        self.connection_state.connection = "close"
+        self.ev.emit("connection.update", {
+            "connection": "close",
+            "last_disconnect": {"error": error, "status": status},
+        })
+
+    def _classify_close(self, exc: Exception) -> int:
+        """Map a websocket exception to a :class:`DisconnectReason` value."""
+        if isinstance(exc, ConnectionClosedOK):
+            # Server closed cleanly — typically means a planned restart.
+            return DisconnectReason.restart_required.value
+        if isinstance(exc, ConnectionClosedError):
+            msg = str(exc).lower()
+            if "no close frame" in msg or "abrupt" in msg:
+                # The server dropped the TCP connection without sending a
+                # proper WS close frame. Almost always a network drop
+                # or a server-side idle timeout.
+                return DisconnectReason.connection_lost.value
+            if "401" in msg or "logged out" in msg:
+                return DisconnectReason.logged_out.value
+            if "403" in msg or "forbidden" in msg:
+                return DisconnectReason.forbidden.value
+            return DisconnectReason.connection_closed.value
+        if isinstance(exc, asyncio.TimeoutError):
+            return DisconnectReason.timed_out.value
+        return DisconnectReason.connection_lost.value
+
+    def _maybe_schedule_reconnect(self) -> None:
+        """Schedule an auto-reconnect if config allows it.
+
+        Uses exponential backoff: ``delay = base * (mult ** attempts)``,
+        capped at ``reconnect_max_delay_ms``. Stops after
+        ``max_reconnect_attempts`` and gives up.
+        """
+        if not self.config.auto_reconnect:
+            return
+        if self._is_intentional_disconnect:
+            return
+        if self._reconnect_attempts >= self.config.max_reconnect_attempts:
+            self.logger.error(
+                {"attempts": self._reconnect_attempts},
+                "max reconnect attempts reached — giving up",
+            )
+            return
+
+        # Compute backoff delay
+        base = self.config.reconnect_delay_ms / 1000
+        mult = self.config.reconnect_backoff_multiplier
+        max_delay = self.config.reconnect_max_delay_ms / 1000
+        delay = base * (mult ** self._reconnect_attempts)
+        delay = min(delay, max_delay)
+
+        self._reconnect_attempts += 1
+        self.logger.info(
+            {"delay_s": delay, "attempt": self._reconnect_attempts},
+            "scheduling reconnect",
+        )
+
+        # Cancel any prior pending reconnect task
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+
+        async def _reconnect_after_delay() -> None:
+            try:
+                await asyncio.sleep(delay)
+                if self._is_intentional_disconnect:
+                    return
+                await self.connect()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.logger.error({"err": str(exc)}, "reconnect task failed")
+
+        self._reconnect_task = asyncio.ensure_future(_reconnect_after_delay())
+
     async def _recv_loop(self) -> None:
+        """Receive WebSocket messages, decode frames, dispatch nodes.
+
+        Distinguishes between a clean WS close (ConnectionClosedOK) and
+        an abrupt close (ConnectionClosedError), and schedules an
+        auto-reconnect if appropriate.
+        """
         try:
             async for raw in self._ws:
                 if not isinstance(raw, (bytes, bytearray)):
                     raw = raw.encode() if isinstance(raw, str) else bytes(raw)
-                frames = self._noise.decode_frame(bytes(raw))
+                try:
+                    frames = self._noise.decode_frame(bytes(raw))
+                except Exception as exc:
+                    self.logger.warn({"err": str(exc)},
+                                     "frame decode failed — skipping")
+                    continue
                 for frame in frames:
-                    await self._handle_frame(frame)
+                    try:
+                        await self._handle_frame(frame)
+                    except Exception as exc:
+                        self.logger.warn({"err": str(exc)},
+                                         "frame handler raised — continuing")
         except asyncio.CancelledError:
-            pass
+            # Intentional cancel from disconnect() — don't reconnect.
+            return
+        except ConnectionClosedOK as exc:
+            self.logger.info({"reason": str(exc)},
+                             "WS closed cleanly — will reconnect")
+            self._emit_close(error=f"server closed cleanly: {exc}",
+                             status=self._classify_close(exc))
+            self._maybe_schedule_reconnect()
+        except ConnectionClosedError as exc:
+            # This is the "no close frame received or sent" case —
+            # common when WA server times us out or a network blip
+            # drops the TCP connection. Don't log as "crashed" — this
+            # is expected, just trigger a reconnect.
+            status = self._classify_close(exc)
+            self.logger.warn(
+                {"err": str(exc), "status": status},
+                "WS closed (no close frame) — scheduling reconnect",
+            )
+            self._emit_close(error=str(exc), status=status)
+            self._maybe_schedule_reconnect()
         except Exception as exc:
-            self.logger.error({"err": str(exc)}, "recv loop crashed")
-            self.ev.emit("connection.update", {
-                "connection": "close",
-                "last_disconnect": {"error": str(exc),
-                                     "status": DisconnectReason.connection_lost.value},
-            })
+            # Unexpected crash — log loudly, then try to reconnect.
+            self.logger.error({"err": str(exc), "type": type(exc).__name__},
+                               "recv loop crashed")
+            self._emit_close(error=str(exc),
+                             status=self._classify_close(exc))
+            self._maybe_schedule_reconnect()
 
     async def _keepalive_loop(self) -> None:
         interval = self.config.keep_alive_interval_ms / 1000
@@ -226,7 +473,7 @@ class WASocket:
             while True:
                 await asyncio.sleep(interval)
                 # Just send a ping — actual protocol uses a specific stanza
-                if self._ws and not self._ws.closed:
+                if self._ws and not _ws_is_closed(self._ws):
                     try:
                         await self._ws.ping(b"")
                     except Exception as exc:

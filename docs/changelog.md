@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+* **Auto-reconnect with exponential backoff** for the
+  `no close frame received or sent` error reported by users.
+  - New `SocketConfig` fields: `auto_reconnect=True`,
+    `max_reconnect_attempts=10`, `reconnect_delay_ms=2000`,
+    `reconnect_max_delay_ms=60000`, `reconnect_backoff_multiplier=1.5`.
+  - `_maybe_schedule_reconnect()` schedules a backoff reconnect that
+    respects intentional disconnects and the attempts cap.
+* **Initial frame send** on connect: `WASocket._send_initial_frame()`
+  sends a `<stream:open>` BinaryNode as the very first frame, so WA
+  server doesn't immediately time the connection out.
+* **Proper websockets exception handling**:
+  - `ConnectionClosedOK` → logged as info, classified as
+    `restart_required` (415).
+  - `ConnectionClosedError` (the "no close frame" case) → logged as
+    warning, classified as `connection_lost` (428), triggers
+    auto-reconnect.
+  - Other exceptions → still logged at error, but still trigger
+    auto-reconnect.
+* **`_ws_is_closed` helper** that works across `websockets<11`,
+  `>=11`, and `>=14` (which dropped the `closed` attribute on
+  `ClientConnection`).
+* **5 new tests** in `tests/test_smoke.py` covering the
+  auto-reconnect / error-handling surface (now 18 tests total).
+* New `tests/test_live_connect.py` for end-to-end WA WebSocket
+  connection verification.
+* `docs/troubleshooting.md` documents the
+  `no close frame received or sent` error and how to control
+  auto-reconnect.
+
 ### Planned
 
 * Wire in `WAProto/` protobuf schema for full message encryption / decryption
